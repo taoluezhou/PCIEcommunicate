@@ -1,0 +1,326 @@
+#include "mainwindow.h"
+#include "ui_mainwindow.h"
+#include "PCIE.h"
+#include "stdlib.h"
+#include "stdio.h"
+#include <sstream>
+#include <QDebug>
+#include <iostream>
+#include <string>
+#include <QFile>
+#include <QFileDialog>
+using namespace std;
+
+#define PCIE_VID                 0x1172
+#define PCIE_DID                 0xE001
+#define MAX_PCIE_CARD   256
+#define DEMO_PCIE_USER_BAR      PCIE_BAR1
+#define DEMO_PCIE_IO_ADDR       0x00
+#define DEMO_PCIE_FIFO_ID       0x00
+#define AUTONUM					13
+#define TESTTIME				2499
+
+// communicate 对话框
+
+FILE *fp;
+PCIE m_hPCIE;
+PCIE_CONFIG m_szPcieInfo[256];
+DWORD   m_dwCardNum;
+
+int i = 0;
+float ratio = 1.5;
+float start_x = 400;
+float start_y = 100;
+float end_x = 960;
+float end_y = 660;
+float coordinate[100][2];		//点坐标
+int decodeTimes = 0;			//手动模式下，已测试帧数
+bool drawStatus = 0;			//手动模式下，画图标志
+float snrMunual[TESTTIME];			//记录手动模式下信噪比
+unsigned long frameManual[TESTTIME];	//记录手动模式下译码帧数
+int sortInfo[TESTTIME];				//手动模式信噪比排序
+int paintFlag = 0;				//曲线重绘标志
+int paintNum = 0;				//重绘个数
+bool resetStatus;
+float testSnr[TESTTIME];
+int notZeroTimes = 0;
+
+unsigned long decodeStatus;				//译码完成标志位
+unsigned long errNum[TESTTIME];				//记录误码帧数
+unsigned long errStore;					//显示的误码帧数
+unsigned long frame_pcie_clocks;		//pcie时钟数
+unsigned long frame_one_clocks;			//译码时钟数
+unsigned long frame_decoder_clocks;		//译码时钟数
+unsigned long frame_all_clocks;			//译码时钟数
+unsigned long frequency;
+unsigned long latency;
+float throughput;
+
+float floatData[AUTONUM][2] = { { 1,0.847 },{ 1.2,0.694 },{ 1.4,0.571 },{ 1.6,0.400 },{ 1.8,0.262 },{ 2,0.158 },
+{ 2.2,0.0833 },{ 2.4,0.0415 },{ 2.6,0.02043 },{ 2.8,0.00923 },{ 3,0.004396 },{ 3.2,0.001851 },{ 3.4,0.000823 } };	//软件仿真数据
+float quaData[AUTONUM][2] = { { 1,0.850 },{ 1.2,0.695 },{ 1.4,0.573 },{ 1.6,0.401 },{ 1.8,0.263 },{ 2,0.160 },
+{ 2.2,0.0844 },{ 2.4,0.04258 },{ 2.6,0.02062 },{ 2.8,0.00928 },{ 3,0.004504 },{ 3.2,0.001862 },{ 3.4,0.000826 } };	//软件量化数据
+float snrAuto[AUTONUM] = { 1,1.2,1.4,1.6,1.8,2,2.2,2.4,2.6,2.8,3,3.2,3.4 };								//自动模式下固定信噪比
+unsigned long frameAuto[AUTONUM] = { 10000,10000,10000,10000,10000,
+100000,100000,100000,100000,200000,
+500000,700000,1000000 };//自动模式下测试帧数
+
+MainWindow::MainWindow(QWidget *parent) :
+    QMainWindow(parent),
+    ui(new Ui::MainWindow)
+{
+    ui->setupUi(this);
+}
+
+MainWindow::~MainWindow()
+{
+    delete ui;
+}
+
+
+
+bool MainWindow::rebuildboard()
+{
+const WORD wVendorID = 0;
+    const WORD wDeviceID = 0;
+    bool bSuccess;
+    DWORD dwDeviceNum;
+    m_dwCardNum = 0;
+    bSuccess = m_hPCIE.ScanCard(wVendorID, wDeviceID, &dwDeviceNum, m_szPcieInfo);
+    if (!bSuccess) {
+       qDebug()<<"Failed to scan pcie card!";
+       // MessageBox(_T("Failed to scan pcie card!"));
+    }
+    else if (dwDeviceNum == 0) {
+    qDebug()<<"Cannot find any desired pcie card!";
+       // MessageBox(_T("Cannot find any desired pcie card!"));
+    }
+    else {
+        m_dwCardNum = dwDeviceNum;
+        int nDefaultIndex = 0;
+        for (int i = 0; i < (int)dwDeviceNum; i++) {
+            PCIE_CONFIG *p = (PCIE_CONFIG *)&m_szPcieInfo[i];
+            if (p->VendorID == 0x1172 && p->DeviceID == 0xE001)
+            {
+            }
+        }
+    }
+    return bSuccess;
+
+}
+
+bool MainWindow::connectboard()
+{
+bool bSuccess;
+        if (m_hPCIE.IsOpened())
+            m_hPCIE.Close();
+
+        bSuccess = m_hPCIE.Open(PCIE_VID, PCIE_DID, 0);
+        if (bSuccess)
+        {
+            qDebug()<<"Connect PCIE suc!";
+           // MessageBox(_T("Connect PCIE suc!"));
+            /*this->button_reset->BackColor = System::Drawing::Color::FromArgb(static_cast<System::Int32>(static_cast<System::Byte>(70)), static_cast<System::Int32>(static_cast<System::Byte>(199)),
+                static_cast<System::Int32>(static_cast<System::Byte>(128)));*/
+        }
+        else
+        {
+            qDebug()<<"Connect PCIE error!";
+           // MessageBox(_T("Connect PCIE error!"));
+        }
+
+        /*译码复位标志位*/
+        if (m_hPCIE.Write32(DEMO_PCIE_USER_BAR, DEMO_PCIE_IO_ADDR + 40, 2) == 0)
+        {
+            return 0;
+        }
+        resetStatus = 1;
+        errStore = 0;
+        frame_pcie_clocks = 0;
+        frame_one_clocks = 0;
+        frame_decoder_clocks = 0;
+        frame_all_clocks = 0;
+        frequency = 0;
+        latency = 0;
+        throughput = 0;
+        //ClearLine();
+        return bSuccess;
+}
+
+
+
+void MainWindow::on_pushButton_clicked()
+{
+    decodeTimes = 0;
+    drawStatus = 0;
+    if (!m_hPCIE.IsDriverAvailable())
+    {
+        qDebug()<<"Load Driver fail!";
+        //MessageBox(_T("Load Driver fail!"));
+    }
+    else {
+
+        //rebuildboard();
+        connectboard();
+
+    }
+    //return bSuccess;
+}
+
+void MainWindow::on_read_clicked()
+{
+        bool bSuccess;
+    /*int d;
+    d = GetDlgItemInt(IDC_EDIT2);*/
+    unsigned long pread;
+    //bSuccess = m_hPCIE.Write32(DEMO_PCIE_USER_BAR, DEMO_PCIE_IO_ADDR + 4, d);
+    int p;
+    //
+    //p = GetDlgItemInt(IDC_EDIT5);
+
+    QString str=ui->Addread->toPlainText();
+     p=str.toInt();
+
+        bSuccess = m_hPCIE.Read32(DEMO_PCIE_USER_BAR, DEMO_PCIE_IO_ADDR + p, &pread);
+    //int sel = pread;
+    ui->Numread->setPlainText(QString::number(pread));
+   // SetDlgItemInt(IDC_EDIT4, sel);
+}
+
+void MainWindow::on_write_clicked()
+{
+    bool bSuccess;
+     //TODO: 在此添加控件通知处理程序代码
+    if (!(m_hPCIE.IsOpened())) {
+        qDebug("Connect to the PCIE Port first");
+        return;
+    }
+
+
+
+    int d;
+    d = (ui->Numwrite->toPlainText()).toUInt();
+
+    int p;
+    p = (ui->Addwrite->toPlainText()).toUInt();
+
+    bSuccess = m_hPCIE.Write32(DEMO_PCIE_USER_BAR, DEMO_PCIE_IO_ADDR+p, d);
+
+}
+
+void MainWindow::DMAwrite()
+{
+    bool bSuccess;
+    if (!(m_hPCIE.IsOpened())) {
+        qDebug()<<"Connect to the PCIE Port first";
+        return;
+    }
+
+    const DWORD nTestSize = 256;
+    const PCIE_LOCAL_ADDRESS LocalAddr = 0;
+    unsigned long pread;
+
+    BYTE *pWrite = new BYTE[nTestSize];
+    BYTE *pRead = new BYTE[nTestSize];
+    char m[50][50];
+    int a = 0;
+    int b = 0;
+    int k = 0;
+
+    QString Qstr=ui->NumDMAwrite->toPlainText();
+    Qstr.replace(QString(","), QString(" "));
+    string str=Qstr.toStdString();
+    //USES_CONVERSION;
+    QList<int> intResults;
+    //parseInt(W2A(str), intResults);
+    for(int i;i<str.length();i++)
+    {
+        if(str[i]!=' ')
+        {
+            m[a][b]=str[i];
+            b++;
+        }
+        else if(str[i]==' ')
+        {
+            a++;
+            b = 0;
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    for(int i=0;i<a+1;i++)
+    {
+        intResults<<atoi(m[i]);
+    }
+    //parseInt(str, intResults);
+    for (int i = 0; i<nTestSize && i< intResults.size(); i++) {
+            pWrite[i]= intResults[i];
+    }
+
+
+    int l;
+    l = ui->AddDMAwrite->toPlainText().toInt();
+    bSuccess = m_hPCIE.DmaWrite(LocalAddr+l, pWrite, nTestSize);
+    qDebug()<<"DMA write done!";
+    delete[]pWrite;
+    delete[]pRead;
+}
+
+void MainWindow::on_DMAread_clicked()
+{
+    bool bSuccess;
+    if (!(m_hPCIE.IsOpened())) {
+        qDebug()<<"Connect to the PCIE Port first";
+        return;
+    }
+    //const DWORD nTestSize = 256; //by zxj 06111534
+    const int nTestSize = 16;
+    const PCIE_LOCAL_ADDRESS LocalAddr = 0;    
+    unsigned long pread;    
+
+    BYTE *pWrite = new BYTE[nTestSize];
+    BYTE *pRead = new BYTE[nTestSize];
+
+    int p=ui->AddDMAread->toPlainText().toInt();
+    int count=ui->CountTextEdit->toPlainText().toInt();
+
+    QFile file("C:\\Users\\Erick\\Desktop\\PCIEcommunicate\\DMAread.txt");
+ //   QByteArray array;
+
+    qDebug()<<count;
+
+
+    for(int i=0;i<count;i++)
+    {
+        bSuccess = m_hPCIE.DmaRead(LocalAddr+p+i, pRead, nTestSize);
+        if(bSuccess)
+        {
+
+            if(file.open(QFile::WriteOnly | QIODevice::Append |  QIODevice::Text)){
+                qDebug()<<"write suc!";
+                QTextStream out(&file);
+                out <<"=========================="<<'\n'<<bin<<*pRead<<endl;
+                if(i+1==count){
+                    out <<"=========================="<<'\n';
+                }
+                file.close();
+            }
+            else{
+                qDebug()<<"write failed!";
+            }
+        }
+    }
+
+
+    // free memory
+        delete []pWrite;
+        delete []pRead;
+
+
+    //CString str, o_str,o_str2,o_str3;
+    //CString str1, str2,str3;
+
+}
